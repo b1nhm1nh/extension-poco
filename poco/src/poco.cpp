@@ -8,7 +8,6 @@
 
 #define MODULE_NAME Poco
 #define LIB_NAME "poco_helper"
-#define HTTP_PATH "/poco"
 
 
 namespace dmPoco
@@ -16,9 +15,6 @@ namespace dmPoco
 
 struct PocoContext
 {
-    char*               m_Buffer;
-    uint32_t            m_BufferSize;
-    uint32_t            m_BufferCapacity;
     bool                m_Initialized;
     uint64_t            m_LastTime;
 
@@ -32,9 +28,10 @@ static int Poco_Dump(lua_State* L)
 
     dmVMath::Matrix4* view_proj = dmScript::CheckMatrix4(L, 1);
     dmVMath::Matrix4* gui_view_proj = dmScript::CheckMatrix4(L, 2);
+    bool only_visible = lua_toboolean(L, 3);
 
     // Creates a table
-    dmPoco::DumpToLuaTable(L, g_Poco.m_Register, *view_proj, *gui_view_proj);
+    dmPoco::DumpToLuaTable(L, g_Poco.m_Register, *view_proj, *gui_view_proj, only_visible);
 
     return 1;
 }
@@ -163,7 +160,6 @@ static dmExtension::Result Finalize(dmExtension::Params* params)
 static dmExtension::Result OnUpdate(dmExtension::Params* params)
 {
     if (!g_Poco.m_Initialized)
-
         return dmExtension::RESULT_OK;
 
     uint64_t time = dmTime::GetTime();
@@ -180,4 +176,3 @@ static dmExtension::Result OnUpdate(dmExtension::Params* params)
 DM_DECLARE_EXTENSION(MODULE_NAME, LIB_NAME, dmPoco::AppInitialize, dmPoco::AppFinalize, dmPoco::Initialize, dmPoco::OnUpdate, 0, dmPoco::Finalize)
 
 #undef LIB_NAME
-#undef HTTP_PATH

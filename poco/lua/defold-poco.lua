@@ -24,17 +24,12 @@ PocoManager.gui_view_proj = vmath.matrix4()
 -- rpc methods registration
 local dispatcher = {
     GetSDKVersion = function() return VERSION end,
+    -- onlyVisibleNode (poco default true): skip the children of disabled gui nodes.
     Dump = function(onlyVisibleNode)
-        --[[
-        NOTE: onlyVisibleNode is not supported yet
-        We could potentially support it by culling the items outside of the screen boundaries
         if onlyVisibleNode == nil then
             onlyVisibleNode = true
         end
-        --]]
-
-        local w, h = window.get_size()
-        return poco_helper.dump(PocoManager.view_proj, PocoManager.gui_view_proj)
+        return poco_helper.dump(PocoManager.view_proj, PocoManager.gui_view_proj, onlyVisibleNode)
     end,
     Click = function(x, y)
         x, y = unit_to_screen(x, y)
@@ -86,6 +81,8 @@ local dispatcher = {
         poco_helper.keyevent(val)
         return true
     end,
+    -- Runs any Lua sent by a client: only registered when init_server is called
+    -- with { allow_execute = true } (see below).
     Execute = function(msg)
         local ok, pcall_result = pcall(loadstring, msg)
         if not ok then
@@ -113,68 +110,109 @@ local dispatcher = {
 local callbacks = {
 }
 
+-- Execute is kept out of the dispatcher unless asked for.
+local execute_fn = dispatcher.Execute
+dispatcher.Execute = nil
 
-function PocoManager:init_server(port)
+
+-- init_server(port [, opts])
+--   opts.host           address to bind, default "127.0.0.1" (reachable through
+--                       `adb forward` / `iproxy`); "*" for every interface
+--   opts.allow_execute  register the Execute rpc (runs any Lua), default false
+--   opts.max_message    largest request in bytes, default 4 MB
+-- Returns true when the server listens, or false + error.
+function PocoManager:init_server(port, opts)
     if poco_helper == nil then
         print("extension-poco: The native code is missing, aborting Poco initalization")
-        return
+        return false, "no native code"
     end
-    print("POCO server init")
+    if self.server_sock then
+        return true
+    end
+    opts = opts or {}
     port = port or 15004
+    local host = opts.host or "127.0.0.1"
+    self.max_message = opts.max_message
+    dispatcher.Execute = opts.allow_execute and execute_fn or nil
+
     local server_sock, err = socket.tcp()
-    assert(server_sock)
-    table.insert(self.all_socks, server_sock)
-    self.server_sock = server_sock
+    if not server_sock then
+        print("[poco] socket.tcp failed: " .. tostring(err))
+        return false, err
+    end
     server_sock:setoption('reuseaddr', true)
     server_sock:setoption('keepalive', true)
     server_sock:settimeout(0.0)
-    server_sock:bind('*', port)
-    server_sock:listen(5)
-    print(string.format('[poco] server listens on tcp://*:%s', port))
+    local ok, berr = server_sock:bind(host, port)
+    if ok then
+        ok, berr = server_sock:listen(5)
+    end
+    if not ok then
+        server_sock:close()
+        print(string.format("[poco] cannot listen on tcp://%s:%s: %s", host, port, tostring(berr)))
+        return false, berr
+    end
+    self.all_socks = { server_sock }
+    self.clients = {}
+    self.server_sock = server_sock
+    print(string.format('[poco] server listens on tcp://%s:%s%s', host, port,
+        opts.allow_execute and " (Execute on)" or ""))
+    return true
+end
+
+function PocoManager:stop_server()
+    for _, c in pairs(self.clients) do
+        c:close()
+    end
+    if self.server_sock then
+        self.server_sock:close()
+    end
+    self.server_sock = nil
+    self.all_socks = {}
+    self.clients = {}
 end
 
 -- TODO: perhaps drive this automatically from the extension update loop?
 function PocoManager:server_loop()
-    if poco_helper == nil then
+    if poco_helper == nil or self.server_sock == nil then
         return
     end
 
-    for _, c in pairs(self.clients) do
-        c:drainOutputBuffer()
-    end
-
-    local r, w, e = socket.select(self.all_socks, nil, 0)
-    if #r > 0 then
-        local removed_socks = {}
-
-        for i, v in ipairs(r) do
+    local r = socket.select(self.all_socks, nil, 0)
+    if r and #r > 0 then
+        local gone = false
+        for _, v in ipairs(r) do
             if v == self.server_sock then
                 local client_sock, err = self.server_sock:accept()
-                print('[poco] new client accepted', client_sock:getpeername(), err)
-                table.insert(self.all_socks, client_sock)
-                self.clients[client_sock] = ClientConnection:new(client_sock, self.DEBUG)
+                if client_sock then
+                    print('[poco] new client accepted', client_sock:getpeername())
+                    table.insert(self.all_socks, client_sock)
+                    self.clients[client_sock] = ClientConnection:new(client_sock, self.DEBUG, self.max_message)
+                elseif err ~= 'timeout' then
+                    print('[poco] accept failed: ' .. tostring(err))
+                end
             else
                 local client = self.clients[v]
-                local reqs = client:receive()
-                if reqs == '' then
-                    -- client is gone
-                    self.clients[v] = nil
-                    table.insert(removed_socks, v)
-                elseif reqs ~= nil then
-                    for _, req in ipairs(reqs) do
-                        self:onRequest(req)
+                if client then
+                    local reqs = client:receive()
+                    if reqs == '' then
+                        self.clients[v] = nil
+                        gone = true
+                    elseif reqs ~= nil then
+                        for _, req in ipairs(reqs) do
+                            self:onRequest(req)
+                        end
                     end
                 end
             end
         end
 
-        for _, s in pairs(removed_socks) do
-            for i, v in ipairs(self.all_socks) do
-                if v == s then
-                    table.remove(self.all_socks, i)
-                    break  -- break inner loop only
-                end
+        if gone then
+            local keep = { self.server_sock }
+            for _, s in ipairs(self.all_socks) do
+                if self.clients[s] then keep[#keep + 1] = s end
             end
+            self.all_socks = keep
         end
     end
 
@@ -203,7 +241,7 @@ end
 function PocoManager:onRequest(req)
     local client = req.client
     local method = req.method
-    local params = req.params
+    local params = type(req.params) == 'table' and req.params or {}
     local func = dispatcher[method]
     local client_callback = callbacks[method]
     local ret = {
@@ -213,11 +251,11 @@ function PocoManager:onRequest(req)
         error = nil,
     }
     if func == nil then
-        ret.error = {message = string.format('No such rpc method "%s", reqid: %s, client:%s', method, req.id, req.client:getAddress())}
+        ret.error = {code = -32601, message = string.format('No such rpc method "%s", reqid: %s, client:%s', tostring(method), tostring(req.id), client:getAddress())}
         client:send(ret)
     else
         xpcall(function()
-            local result = func(unpack(params))
+            local result = func((table.unpack or unpack)(params))
             if type(result) == 'function' then
                 result(function(cbresult)
                     ret.result = cbresult

@@ -15,7 +15,7 @@ end
 function init(self)
     msg.post("@render:", "use_fixed_fit_projection", { near = -1, far = 1 })
 
-    poco:init_server(15004)
+    poco:init_server(15004, { host = "*", allow_execute = true }) -- example app: reachable from the network, Execute on
 
     poco:set_dispatch_fn("TestNewFunction", function(x, y, z)
             print("INSIDE NEW CLIENT TEST FUNCTION!", x, y, z)

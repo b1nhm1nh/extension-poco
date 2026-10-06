@@ -45,6 +45,18 @@ Create a PocoManager instance at game startup:
         poco:init_server(15004) -- default port for Poco
     end
 
+`init_server(port, opts)` options:
+
+| option | default | |
+|---|---|---|
+| `host` | `"127.0.0.1"` | address to bind. Localhost is reachable through `adb forward tcp:15004 tcp:15004` (Android) and `iproxy 15004 15004` (iOS). `"*"` listens on every interface (anyone on the network can connect). |
+| `allow_execute` | `false` | registers the `Execute` rpc, which runs any Lua a client sends. Only for trusted networks / debug builds. |
+| `max_message` | 4 MB | largest request; a bigger length header closes the connection. |
+
+It returns `true`, or `false` and an error (port in use, no native code).
+`poco:stop_server()` closes the server and all clients. HTML5 has no TCP
+server sockets: don't call `init_server` there.
+
 Update the PocoManager instance continuously:
 
     function update(self, dt)
@@ -112,6 +124,8 @@ You create a `StdPoco` instance using an `ip address` and a `port`:
     poco = StdPoco(addr=(ipaddress, port), device=device, use_airtest_input=False)
 
 If you are using Android, you don't know the ipaddress of the device, you can use a `device = None` and ipaddress 0 `0.0.0.0`.
+With the default `host = "127.0.0.1"`, forward the port first
+(`adb forward tcp:15004 tcp:15004`) and connect to `127.0.0.1`.
 
 The default port for the poco server in the extension is `15004`
 

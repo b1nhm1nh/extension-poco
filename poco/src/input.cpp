@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <string.h>
 
 #include <dmsdk/dlib/log.h>
 
@@ -30,11 +31,13 @@ struct InputEvent
     float   m_Elapsed;
     float   m_Duration;
     int32_t m_MouseButton;
+    uint32_t m_TouchId;
 
     // Key event
     const char* m_KeyCodes;
     uint32_t    m_KeyCodesLen;
     uint32_t    m_KeyCodesIndex;
+    int32_t     m_HeldKey;      // key pressed last frame, released this frame (-1: none)
 
     int32_t m_Type;
 };
@@ -47,11 +50,10 @@ void InitInput()
 }
 
 
-static void DoTouch(dmHID::HMouse mouse, dmHID::HTouchDevice device, int32_t x, int32_t y, bool pressed, bool released)
+static void DoTouch(dmHID::HMouse mouse, dmHID::HTouchDevice device, uint32_t touch_id, int32_t x, int32_t y, bool pressed, bool released)
 {
     if (dmHID::INVALID_TOUCH_DEVICE_HANDLE != device)
     {
-        uint32_t touch_id = 0;
         dmHID::Phase phase = dmHID::PHASE_MOVED;
         if (pressed)
             phase = dmHID::PHASE_BEGAN;
@@ -61,8 +63,8 @@ static void DoTouch(dmHID::HMouse mouse, dmHID::HTouchDevice device, int32_t x, 
     }
 
     // We also have a "fast path" for the "touch" action, which is implemented via the mouse button 1
-    // See g_MouseEmulationTouch in android_init.c in Defold source
-    if (dmHID::INVALID_MOUSE_HANDLE != mouse)
+    // See g_MouseEmulationTouch in android_init.c in Defold source. Only the first touch drives it.
+    if (dmHID::INVALID_MOUSE_HANDLE != mouse && touch_id == 0)
     {
         dmHID::SetMouseButton(mouse, dmHID::MOUSE_BUTTON_LEFT, released?false:true);
         dmHID::SetMousePosition(mouse, x, y);
@@ -83,6 +85,13 @@ static void AddMouseInput(dmHID::MouseButton button, int32_t x1, int32_t y1, int
     ev.m_Y2 = y2;
     ev.m_Duration = duration;
     ev.m_Elapsed = 0;
+    // Concurrent mouse events (pinch: two swipes) are separate touches.
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < g_PocoInputEvents.Size(); ++i)
+        if (g_PocoInputEvents[i].m_Type == INPUT_EVENT_MOUSE)
+            used |= 1u << g_PocoInputEvents[i].m_TouchId;
+    while (ev.m_TouchId < 31 && (used & (1u << ev.m_TouchId)))
+        ev.m_TouchId++;
     g_PocoInputEvents.Push(ev);
 }
 
@@ -99,9 +108,12 @@ static void AddKeyInput(const char* keycodes)
 
     InputEvent ev;
     ev.m_Type = INPUT_EVENT_KEY;
-    ev.m_KeyCodes = strdup(keycodes);
+    char* copy = (char*)malloc(len + 1);
+    memcpy(copy, keycodes, len + 1);
+    ev.m_KeyCodes = copy;
     ev.m_KeyCodesLen = len;
     ev.m_KeyCodesIndex = 0;
+    ev.m_HeldKey = -1;
     g_PocoInputEvents.Push(ev);
 }
 
@@ -150,7 +162,7 @@ static bool UpdateMouseEvent(dmHID::HMouse mouse, dmHID::HTouchDevice device, fl
     if (pressed && released)
         released = false;
 
-    DoTouch(mouse, device, (int32_t)x, (int32_t)y, pressed, released);
+    DoTouch(mouse, device, ev.m_TouchId, (int32_t)x, (int32_t)y, pressed, released);
 
     return released;
 }
@@ -184,27 +196,37 @@ static const char* ParseKey(const char* str, uint32_t* len)
 
 static bool UpdateKeyEvent(dmHID::HContext context, dmHID::HKeyboard keyboard, float dt, InputEvent& ev)
 {
+    // A special key is held for one frame, then released (was never released).
+    if (ev.m_HeldKey >= 0)
+    {
+        dmHID::SetKey(keyboard, (dmHID::Key)ev.m_HeldKey, false);
+        ev.m_HeldKey = -1;
+        return ev.m_KeyCodesIndex >= ev.m_KeyCodesLen;
+    }
+    if (ev.m_KeyCodesIndex >= ev.m_KeyCodesLen)
+        return true;
+
     char c = ev.m_KeyCodes[ev.m_KeyCodesIndex];
     uint32_t key_string_len = ev.m_KeyCodesLen - ev.m_KeyCodesIndex;
     const char* key_string = ParseKey(&ev.m_KeyCodes[ev.m_KeyCodesIndex], &key_string_len);
 
-    dmHID::Key key = dmHID::MAX_KEY_COUNT;
     if (key_string)
     {
         dmhash_t key_hash = dmHashBuffer64((const void *)key_string, key_string_len);
-        key = HashToKey(key_hash);
+        dmHID::Key key = HashToKey(key_hash);
 
         if (key != dmHID::MAX_KEY_COUNT)
         {
             dmHID::SetKey(keyboard, key, true);
+            ev.m_HeldKey = (int32_t)key;
             ev.m_KeyCodesIndex += key_string_len + 2; // '{' + text + '}'
-            return ev.m_KeyCodesIndex == ev.m_KeyCodesLen;
+            return false; // released next frame
         }
     }
 
     ev.m_KeyCodesIndex++;
     dmHID::AddKeyboardChar(context, c);
-    return ev.m_KeyCodesIndex == ev.m_KeyCodesLen;
+    return ev.m_KeyCodesIndex >= ev.m_KeyCodesLen;
 }
 
 void UpdateInput(dmHID::HContext context, float dt)
@@ -216,11 +238,11 @@ void UpdateInput(dmHID::HContext context, float dt)
     device = dmHID::GetTouchDevice(context, 0);
 #endif
 
-    for (uint32_t i = 0; i < g_PocoInputEvents.Size(); ++i)
+    for (uint32_t i = 0; i < g_PocoInputEvents.Size(); )
     {
         InputEvent& ev = g_PocoInputEvents[i];
 
-        bool released;
+        bool released = true;
         switch(ev.m_Type)
         {
         case INPUT_EVENT_MOUSE: released = UpdateMouseEvent(mouse, device, dt, ev); break;
@@ -228,7 +250,14 @@ void UpdateInput(dmHID::HContext context, float dt)
         }
 
         if (released)
-            g_PocoInputEvents.EraseSwap(i);
+        {
+            ReleaseKeyInput(ev);                // the strdup'ed key string (was leaked)
+            g_PocoInputEvents.EraseSwap(i);     // the swapped-in event runs this frame too
+        }
+        else
+        {
+            ++i;
+        }
     }
 }
 
